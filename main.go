@@ -5,13 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
-	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
+	authpb "auth_service/proto"
 	nexusai "nexus/proto/nexusai/v1"
 
+	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/adaptor"
+	"github.com/gofiber/fiber/v3/middleware/cors"
+	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -20,10 +25,15 @@ import (
 )
 
 type analyzeRequest struct {
-	UserTZ      string       `json:"user_tz"`
-	Points      []trackPoint `json:"points"`
-	WeekStarts  string       `json:"week_starts"`
-	Constraints constraints  `json:"constraints"`
+	UserTZ      string      `json:"user_tz"`
+	WeekStarts  string      `json:"week_starts"`
+	Constraints constraints `json:"constraints"`
+	Period      string      `json:"period"`
+}
+
+type trackRequest struct {
+	UserTZ string       `json:"user_tz"`
+	Points []trackPoint `json:"points"`
 }
 
 type trackPoint struct {
@@ -79,71 +89,124 @@ func main() {
 		target = "nexus_ai:9091"
 	}
 
-	conn, err := grpc.Dial(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	authTarget := os.Getenv("AUTH_SERVICE_ADDR")
+	if authTarget == "" {
+		authTarget = "auth_service:9090"
+	}
+
+	aiConn, err := grpc.Dial(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("grpc dial: %v", err)
 	}
-	defer conn.Close()
+	defer aiConn.Close()
 
-	client := nexusai.NewAnalyzerServiceClient(conn)
+	authConn, err := grpc.Dial(authTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("auth grpc dial: %v", err)
+	}
+	defer authConn.Close()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
+	aiClient := nexusai.NewAnalyzerServiceClient(aiConn)
+
+	app := fiber.New()
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: []string{"*"},
+		AllowHeaders: []string{"Authorization", "Content-Type"},
+		AllowMethods: []string{"GET", "POST", "OPTIONS"},
+	}))
+
+	app.Get("/health", func(c fiber.Ctx) error {
+		return c.SendStatus(fiber.StatusOK)
 	})
-	mux.HandleFunc("/ai/analyze", func(w http.ResponseWriter, r *http.Request) {
-		handleAnalyze(w, r, client)
+	app.Post("/ai/analyze", func(c fiber.Ctx) error {
+		return handleAnalyze(c, aiClient)
 	})
+	app.Post("/ai/track", func(c fiber.Ctx) error {
+		return handleTrack(c, aiClient)
+	})
+
+	gwMux := runtime.NewServeMux(runtime.WithIncomingHeaderMatcher(incomingHeaderMatcher))
+	if err := authpb.RegisterAuthServiceHandler(context.Background(), gwMux, authConn); err != nil {
+		log.Fatalf("register auth gateway: %v", err)
+	}
+
+	app.All("/auth/*", adaptor.HTTPHandler(gwMux))
+	app.All("/auth", adaptor.HTTPHandler(gwMux))
 
 	log.Printf("gateway listening on :%s", port)
-	if err := http.ListenAndServe(":"+port, withCORS(mux)); err != nil {
+	if err := app.Listen(":" + port); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func handleAnalyze(w http.ResponseWriter, r *http.Request, client nexusai.AnalyzerServiceClient) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
+func handleAnalyze(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
 	var in analyzeRequest
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if len(in.Points) < 2 {
-		http.Error(w, "need at least 2 points for stable analytics", http.StatusBadRequest)
-		return
+	if err := json.Unmarshal(c.Body(), &in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "bad json: "+err.Error())
 	}
 
 	grpcReq, err := mapRequest(in)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
 	defer cancel()
-	ctx = withAuthMetadata(ctx, r)
+	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
 
 	resp, err := client.Analyze(ctx, grpcReq)
 	if err != nil {
-		http.Error(w, "analyze error: "+err.Error(), http.StatusInternalServerError)
-		return
+		return fiber.NewError(fiber.StatusInternalServerError, "analyze error: "+err.Error())
 	}
 
 	out, err := mapResponse(resp)
 	if err != nil {
-		http.Error(w, "response error: "+err.Error(), http.StatusInternalServerError)
-		return
+		return fiber.NewError(fiber.StatusInternalServerError, "response error: "+err.Error())
 	}
 
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(out)
+	return c.JSON(out)
+}
+
+func handleTrack(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
+	var in trackRequest
+	if err := json.Unmarshal(c.Body(), &in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "bad json: "+err.Error())
+	}
+	if len(in.Points) == 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "points are required")
+	}
+
+	grpcReq, err := mapTrackRequest(in)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
+
+	resp, err := client.Track(ctx, grpcReq)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "track error: "+err.Error())
+	}
+
+	return c.JSON(fiber.Map{"stored": resp.GetStored()})
 }
 
 func mapRequest(in analyzeRequest) (*nexusai.AnalyzeRequest, error) {
+	req := &nexusai.AnalyzeRequest{
+		UserTz:     in.UserTZ,
+		WeekStarts: in.WeekStarts,
+		Constraints: &nexusai.Constraints{
+			WorkStartHour: int32(in.Constraints.WorkStartHour),
+			WorkEndHour:   int32(in.Constraints.WorkEndHour),
+		},
+		Period: mapPeriod(in.Period),
+	}
+	return req, nil
+}
+
+func mapTrackRequest(in trackRequest) (*nexusai.TrackRequest, error) {
 	points := make([]*nexusai.TrackPoint, 0, len(in.Points))
 	for _, p := range in.Points {
 		if p.TS.IsZero() {
@@ -158,16 +221,10 @@ func mapRequest(in analyzeRequest) (*nexusai.AnalyzeRequest, error) {
 		})
 	}
 
-	req := &nexusai.AnalyzeRequest{
-		UserTz:     in.UserTZ,
-		Points:     points,
-		WeekStarts: in.WeekStarts,
-		Constraints: &nexusai.Constraints{
-			WorkStartHour: int32(in.Constraints.WorkStartHour),
-			WorkEndHour:   int32(in.Constraints.WorkEndHour),
-		},
-	}
-	return req, nil
+	return &nexusai.TrackRequest{
+		UserTz: in.UserTZ,
+		Points: points,
+	}, nil
 }
 
 func mapResponse(in *nexusai.AnalyzeResponse) (*analyzeResponse, error) {
@@ -242,8 +299,8 @@ func intKey(v int32) string {
 	return strconv.FormatInt(int64(v), 10)
 }
 
-func withAuthMetadata(ctx context.Context, r *http.Request) context.Context {
-	auth := r.Header.Get("Authorization")
+func withAuthMetadata(ctx context.Context, authHeader string) context.Context {
+	auth := strings.TrimSpace(authHeader)
 	if auth == "" {
 		return ctx
 	}
@@ -251,15 +308,27 @@ func withAuthMetadata(ctx context.Context, r *http.Request) context.Context {
 	return metadata.NewOutgoingContext(ctx, md)
 }
 
-func withCORS(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+func incomingHeaderMatcher(key string) (string, bool) {
+	if strings.EqualFold(key, "authorization") {
+		return "authorization", true
+	}
+	if strings.EqualFold(key, "x-request-id") {
+		return "x-request-id", true
+	}
+	return runtime.DefaultHeaderMatcher(key)
+}
+
+func mapPeriod(v string) nexusai.Period {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "day":
+		return nexusai.Period_PERIOD_DAY
+	case "week":
+		return nexusai.Period_PERIOD_WEEK
+	case "month":
+		return nexusai.Period_PERIOD_MONTH
+	case "all":
+		return nexusai.Period_PERIOD_ALL
+	default:
+		return nexusai.Period_PERIOD_UNSPECIFIED
+	}
 }
