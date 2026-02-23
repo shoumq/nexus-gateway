@@ -37,11 +37,19 @@ type trackRequest struct {
 }
 
 type trackPoint struct {
-	TS         time.Time `json:"ts"`
-	SleepHours float64   `json:"sleep_hours"`
-	Mood       float64   `json:"mood"`
-	Activity   float64   `json:"activity"`
-	Productive float64   `json:"productive"`
+	TS            time.Time `json:"ts"`
+	SleepHours    float64   `json:"sleep_hours"`
+	Mood          float64   `json:"mood"`
+	Activity      float64   `json:"activity"`
+	Productive    float64   `json:"productive"`
+	Stress        float64   `json:"stress"`
+	Energy        float64   `json:"energy"`
+	Concentration float64   `json:"concentration"`
+	SleepQuality  float64   `json:"sleep_quality"`
+	Caffeine      bool      `json:"caffeine"`
+	Alcohol       bool      `json:"alcohol"`
+	Workout       bool      `json:"workout"`
+	LLMText       string    `json:"llm_text"`
 }
 
 type constraints struct {
@@ -50,7 +58,6 @@ type constraints struct {
 }
 
 type analyzeResponse struct {
-	EnergyByHour      map[string]float64 `json:"energy_by_hour"`
 	EnergyByWeekday   map[string]float64 `json:"energy_by_weekday"`
 	ProductivityModel productivityModel  `json:"productivity_model"`
 	BurnoutRisk       burnoutRisk        `json:"burnout_risk"`
@@ -150,7 +157,13 @@ func handleAnalyze(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 
-	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
+	timeout := 60 * time.Second
+	if v := os.Getenv("ANALYZE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			timeout = d
+		}
+	}
+	ctx, cancel := context.WithTimeout(c.Context(), timeout)
 	defer cancel()
 	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
 
@@ -213,11 +226,19 @@ func mapTrackRequest(in trackRequest) (*nexusai.TrackRequest, error) {
 			return nil, errors.New("point ts is required")
 		}
 		points = append(points, &nexusai.TrackPoint{
-			Ts:         timestamppb.New(p.TS),
-			SleepHours: p.SleepHours,
-			Mood:       p.Mood,
-			Activity:   p.Activity,
-			Productive: p.Productive,
+			Ts:            timestamppb.New(p.TS),
+			SleepHours:    p.SleepHours,
+			Mood:          p.Mood,
+			Activity:      p.Activity,
+			Productive:    p.Productive,
+			Stress:        p.Stress,
+			Energy:        p.Energy,
+			Concentration: p.Concentration,
+			SleepQuality:  p.SleepQuality,
+			Caffeine:      p.Caffeine,
+			Alcohol:       p.Alcohol,
+			Workout:       p.Workout,
+			LlmText:       p.LLMText,
 		})
 	}
 
@@ -232,11 +253,6 @@ func mapResponse(in *nexusai.AnalyzeResponse) (*analyzeResponse, error) {
 		return nil, errors.New("empty response")
 	}
 
-	energyByHour := make(map[string]float64, len(in.EnergyByHour))
-	for k, v := range in.EnergyByHour {
-		energyByHour[intKey(k)] = v
-	}
-
 	energyByWeekday := make(map[string]float64, len(in.EnergyByWeekday))
 	for k, v := range in.EnergyByWeekday {
 		energyByWeekday[k] = v
@@ -248,7 +264,6 @@ func mapResponse(in *nexusai.AnalyzeResponse) (*analyzeResponse, error) {
 	}
 
 	out := &analyzeResponse{
-		EnergyByHour:    energyByHour,
 		EnergyByWeekday: energyByWeekday,
 		ProductivityModel: productivityModel{
 			Weights: weights,
