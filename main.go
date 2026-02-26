@@ -31,6 +31,10 @@ type analyzeRequest struct {
 	Period      string      `json:"period"`
 }
 
+type todayTrackRequest struct {
+	UserTZ string `json:"user_tz"`
+}
+
 type trackRequest struct {
 	UserTZ string       `json:"user_tz"`
 	Points []trackPoint `json:"points"`
@@ -131,6 +135,12 @@ func main() {
 	app.Post("/ai/track", func(c fiber.Ctx) error {
 		return handleTrack(c, aiClient)
 	})
+	app.Post("/ai/today", func(c fiber.Ctx) error {
+		return handleToday(c, aiClient)
+	})
+	app.Get("/ai/last-analyze", func(c fiber.Ctx) error {
+		return handleLastAnalyze(c, aiClient)
+	})
 
 	gwMux := runtime.NewServeMux(runtime.WithIncomingHeaderMatcher(incomingHeaderMatcher))
 	if err := authpb.RegisterAuthServiceHandler(context.Background(), gwMux, authConn); err != nil {
@@ -194,7 +204,13 @@ func handleTrack(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 
-	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	timeout := 60 * time.Second
+	if v := os.Getenv("TRACK_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			timeout = d
+		}
+	}
+	ctx, cancel := context.WithTimeout(c.Context(), timeout)
 	defer cancel()
 	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
 
@@ -204,6 +220,66 @@ func handleTrack(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
 	}
 
 	return c.JSON(fiber.Map{"stored": resp.GetStored()})
+}
+
+func handleToday(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
+	var in todayTrackRequest
+	_ = json.Unmarshal(c.Body(), &in)
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
+
+	resp, err := client.GetTodayTrack(ctx, &nexusai.TodayTrackRequest{UserTz: in.UserTZ})
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "today error: "+err.Error())
+	}
+	if !resp.GetExists() || resp.GetPoint() == nil {
+		return c.JSON(fiber.Map{"exists": false})
+	}
+	p := resp.GetPoint()
+	out := trackPoint{
+		TS:            p.GetTs().AsTime(),
+		SleepHours:    p.GetSleepHours(),
+		Mood:          p.GetMood(),
+		Activity:      p.GetActivity(),
+		Productive:    p.GetProductive(),
+		Stress:        p.GetStress(),
+		Energy:        p.GetEnergy(),
+		Concentration: p.GetConcentration(),
+		SleepQuality:  p.GetSleepQuality(),
+		Caffeine:      p.GetCaffeine(),
+		Alcohol:       p.GetAlcohol(),
+		Workout:       p.GetWorkout(),
+		LLMText:       p.GetLlmText(),
+	}
+	return c.JSON(fiber.Map{"exists": true, "point": out})
+}
+
+func handleLastAnalyze(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
+
+	resp, err := client.GetLastAnalyses(ctx, &nexusai.LastAnalysesRequest{})
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "last analyze error: "+err.Error())
+	}
+	out := make([]fiber.Map, 0, len(resp.GetEntries()))
+	for _, e := range resp.GetEntries() {
+		if e == nil || e.Response == nil {
+			continue
+		}
+		mapped, err := mapResponse(e.Response)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, "response error: "+err.Error())
+		}
+		out = append(out, fiber.Map{
+			"period":     e.GetPeriod(),
+			"updated_at": e.GetUpdatedAt().AsTime(),
+			"response":   mapped,
+		})
+	}
+	return c.JSON(fiber.Map{"entries": out})
 }
 
 func mapRequest(in analyzeRequest) (*nexusai.AnalyzeRequest, error) {
