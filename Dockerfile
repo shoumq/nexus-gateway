@@ -2,10 +2,13 @@ FROM golang:1.25.7-alpine AS build
 
 WORKDIR /app
 
-COPY nexus-gateway/go.mod ./nexus-gateway/
+RUN apk add --no-cache git
+
+COPY nexus-gateway/go.mod nexus-gateway/go.sum ./nexus-gateway/
 COPY nexus-ai/go.mod nexus-ai/go.sum ./nexus-ai/
 COPY auth_service/go.mod auth_service/go.sum ./auth_service/
 
+ENV GOPROXY=https://proxy.golang.org,direct
 RUN cd /app/nexus-gateway && go mod download
 
 COPY nexus-gateway ./nexus-gateway

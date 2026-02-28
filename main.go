@@ -43,6 +43,8 @@ type trackRequest struct {
 type trackPoint struct {
 	TS            time.Time `json:"ts"`
 	SleepHours    float64   `json:"sleep_hours"`
+	SleepStart    string    `json:"sleep_start"`
+	SleepEnd      string    `json:"sleep_end"`
 	Mood          float64   `json:"mood"`
 	Activity      float64   `json:"activity"`
 	Productive    float64   `json:"productive"`
@@ -54,6 +56,24 @@ type trackPoint struct {
 	Alcohol       bool      `json:"alcohol"`
 	Workout       bool      `json:"workout"`
 	LLMText       string    `json:"llm_text"`
+	AnalysisStatus string   `json:"analysis_status"`
+}
+
+type userProfile struct {
+	UserID  int32  `json:"user_id"`
+	Name    string `json:"name"`
+	Email   string `json:"email"`
+	Emoji   string `json:"emoji"`
+	BgIndex int32  `json:"bg_index"`
+	IsFriend bool  `json:"is_friend"`
+}
+
+type friendRequest struct {
+	ID        int64       `json:"id"`
+	Status    string      `json:"status"`
+	CreatedAt time.Time   `json:"created_at"`
+	From      userProfile `json:"from"`
+	To        userProfile `json:"to"`
 }
 
 type constraints struct {
@@ -140,6 +160,33 @@ func main() {
 	})
 	app.Get("/ai/last-analyze", func(c fiber.Ctx) error {
 		return handleLastAnalyze(c, aiClient)
+	})
+	app.Get("/ai/profile", func(c fiber.Ctx) error {
+		return handleGetProfile(c, aiClient)
+	})
+	app.Post("/ai/profile", func(c fiber.Ctx) error {
+		return handleUpdateProfile(c, aiClient)
+	})
+	app.Get("/ai/users/:id", func(c fiber.Ctx) error {
+		return handleGetUserProfile(c, aiClient)
+	})
+	app.Get("/ai/users/:id/last-analyses", func(c fiber.Ctx) error {
+		return handleGetUserLastAnalyses(c, aiClient)
+	})
+	app.Get("/ai/friends", func(c fiber.Ctx) error {
+		return handleListFriends(c, aiClient)
+	})
+	app.Get("/ai/friends/requests", func(c fiber.Ctx) error {
+		return handleListFriendRequests(c, aiClient)
+	})
+	app.Get("/ai/friends/search", func(c fiber.Ctx) error {
+		return handleSearchUsers(c, aiClient)
+	})
+	app.Post("/ai/friends/request", func(c fiber.Ctx) error {
+		return handleSendFriendRequest(c, aiClient)
+	})
+	app.Post("/ai/friends/respond", func(c fiber.Ctx) error {
+		return handleRespondFriendRequest(c, aiClient)
 	})
 
 	gwMux := runtime.NewServeMux(runtime.WithIncomingHeaderMatcher(incomingHeaderMatcher))
@@ -240,6 +287,8 @@ func handleToday(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
 	out := trackPoint{
 		TS:            p.GetTs().AsTime(),
 		SleepHours:    p.GetSleepHours(),
+		SleepStart:    p.GetSleepStart(),
+		SleepEnd:      p.GetSleepEnd(),
 		Mood:          p.GetMood(),
 		Activity:      p.GetActivity(),
 		Productive:    p.GetProductive(),
@@ -251,8 +300,171 @@ func handleToday(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
 		Alcohol:       p.GetAlcohol(),
 		Workout:       p.GetWorkout(),
 		LLMText:       p.GetLlmText(),
+		AnalysisStatus: p.GetAnalysisStatus(),
 	}
 	return c.JSON(fiber.Map{"exists": true, "point": out})
+}
+
+func handleGetProfile(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
+
+	resp, err := client.GetMyProfile(ctx, &nexusai.GetMyProfileRequest{})
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "profile error: "+err.Error())
+	}
+	if resp.GetProfile() == nil {
+		return c.JSON(fiber.Map{})
+	}
+	return c.JSON(mapUserProfile(resp.GetProfile()))
+}
+
+type updateProfileRequest struct {
+	Emoji   string `json:"emoji"`
+	BgIndex int32  `json:"bg_index"`
+}
+
+func handleUpdateProfile(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
+	var in updateProfileRequest
+	if err := json.Unmarshal(c.Body(), &in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "bad json: "+err.Error())
+	}
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
+
+	resp, err := client.UpdateMyProfile(ctx, &nexusai.UpdateProfileRequest{
+		Emoji:   in.Emoji,
+		BgIndex: in.BgIndex,
+	})
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "profile update error: "+err.Error())
+	}
+	if resp.GetProfile() == nil {
+		return c.JSON(fiber.Map{})
+	}
+	return c.JSON(mapUserProfile(resp.GetProfile()))
+}
+
+func handleGetUserProfile(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
+	userIDStr := c.Params("id")
+	userID, err := strconv.Atoi(userIDStr)
+	if err != nil || userID <= 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid user id")
+	}
+	ctx, cancel := context.WithTimeout(c.Context(), 8*time.Second)
+	defer cancel()
+	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
+	resp, err := client.GetUserProfile(ctx, &nexusai.GetUserProfileRequest{UserId: int32(userID)})
+	if err != nil {
+		msg := err.Error()
+		if strings.Contains(msg, "permission") || strings.Contains(msg, "denied") {
+			return fiber.NewError(fiber.StatusForbidden, "profile is private")
+		}
+		return fiber.NewError(fiber.StatusInternalServerError, "profile error: "+msg)
+	}
+	if resp.GetProfile() == nil {
+		return fiber.NewError(fiber.StatusNotFound, "profile not found")
+	}
+	return c.JSON(mapUserProfile(resp.GetProfile()))
+}
+
+func handleListFriends(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
+
+	resp, err := client.ListFriends(ctx, &nexusai.ListFriendsRequest{})
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "friends error: "+err.Error())
+	}
+	out := make([]userProfile, 0, len(resp.GetFriends()))
+	for _, u := range resp.GetFriends() {
+		out = append(out, mapUserProfile(u))
+	}
+	return c.JSON(fiber.Map{"friends": out})
+}
+
+func handleListFriendRequests(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
+	status := c.Query("status", "pending")
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
+
+	resp, err := client.ListFriendRequests(ctx, &nexusai.ListFriendRequestsRequest{Status: status})
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "friend requests error: "+err.Error())
+	}
+	out := make([]friendRequest, 0, len(resp.GetRequests()))
+	for _, r := range resp.GetRequests() {
+		out = append(out, mapFriendRequest(r))
+	}
+	return c.JSON(fiber.Map{"requests": out})
+}
+
+func handleSearchUsers(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
+	query := c.Query("q", "")
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
+
+	resp, err := client.SearchUsers(ctx, &nexusai.SearchUsersRequest{Query: query})
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "search error: "+err.Error())
+	}
+	out := make([]userProfile, 0, len(resp.GetUsers()))
+	for _, u := range resp.GetUsers() {
+		out = append(out, mapUserProfile(u))
+	}
+	return c.JSON(fiber.Map{"users": out})
+}
+
+type sendFriendRequest struct {
+	ToUserID int32 `json:"to_user_id"`
+}
+
+func handleSendFriendRequest(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
+	var in sendFriendRequest
+	if err := json.Unmarshal(c.Body(), &in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "bad json: "+err.Error())
+	}
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
+
+	resp, err := client.SendFriendRequest(ctx, &nexusai.SendFriendRequestRequest{ToUserId: in.ToUserID})
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "friend request error: "+err.Error())
+	}
+	if resp.GetRequest() == nil {
+		return c.JSON(fiber.Map{})
+	}
+	return c.JSON(mapFriendRequest(resp.GetRequest()))
+}
+
+type respondFriendRequest struct {
+	RequestID int64  `json:"request_id"`
+	Action    string `json:"action"`
+}
+
+func handleRespondFriendRequest(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
+	var in respondFriendRequest
+	if err := json.Unmarshal(c.Body(), &in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "bad json: "+err.Error())
+	}
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
+
+	_, err := client.RespondFriendRequest(ctx, &nexusai.RespondFriendRequestRequest{
+		RequestId: in.RequestID,
+		Action:    in.Action,
+	})
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "friend respond error: "+err.Error())
+	}
+	return c.JSON(fiber.Map{"ok": true})
 }
 
 func handleLastAnalyze(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
@@ -263,6 +475,42 @@ func handleLastAnalyze(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error 
 	resp, err := client.GetLastAnalyses(ctx, &nexusai.LastAnalysesRequest{})
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "last analyze error: "+err.Error())
+	}
+	out := make([]fiber.Map, 0, len(resp.GetEntries()))
+	for _, e := range resp.GetEntries() {
+		if e == nil || e.Response == nil {
+			continue
+		}
+		mapped, err := mapResponse(e.Response)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, "response error: "+err.Error())
+		}
+		out = append(out, fiber.Map{
+			"period":     e.GetPeriod(),
+			"updated_at": e.GetUpdatedAt().AsTime(),
+			"response":   mapped,
+		})
+	}
+	return c.JSON(fiber.Map{"entries": out})
+}
+
+func handleGetUserLastAnalyses(c fiber.Ctx, client nexusai.AnalyzerServiceClient) error {
+	userIDStr := c.Params("id")
+	userID, err := strconv.Atoi(userIDStr)
+	if err != nil || userID <= 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid user id")
+	}
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+	ctx = withAuthMetadata(ctx, c.Get("Authorization"))
+
+	resp, err := client.GetUserLastAnalyses(ctx, &nexusai.GetUserLastAnalysesRequest{UserId: int32(userID)})
+	if err != nil {
+		msg := err.Error()
+		if strings.Contains(msg, "permission") || strings.Contains(msg, "denied") {
+			return fiber.NewError(fiber.StatusForbidden, "profile is private")
+		}
+		return fiber.NewError(fiber.StatusInternalServerError, "last analyze error: "+msg)
 	}
 	out := make([]fiber.Map, 0, len(resp.GetEntries()))
 	for _, e := range resp.GetEntries() {
@@ -304,6 +552,8 @@ func mapTrackRequest(in trackRequest) (*nexusai.TrackRequest, error) {
 		points = append(points, &nexusai.TrackPoint{
 			Ts:            timestamppb.New(p.TS),
 			SleepHours:    p.SleepHours,
+			SleepStart:    p.SleepStart,
+			SleepEnd:      p.SleepEnd,
 			Mood:          p.Mood,
 			Activity:      p.Activity,
 			Productive:    p.Productive,
@@ -407,6 +657,33 @@ func incomingHeaderMatcher(key string) (string, bool) {
 		return "x-request-id", true
 	}
 	return runtime.DefaultHeaderMatcher(key)
+}
+
+func mapUserProfile(u *nexusai.UserProfile) userProfile {
+	if u == nil {
+		return userProfile{}
+	}
+	return userProfile{
+		UserID:  u.GetUserId(),
+		Name:    u.GetName(),
+		Email:   u.GetEmail(),
+		Emoji:   u.GetEmoji(),
+		BgIndex: u.GetBgIndex(),
+		IsFriend: u.GetIsFriend(),
+	}
+}
+
+func mapFriendRequest(r *nexusai.FriendRequest) friendRequest {
+	if r == nil {
+		return friendRequest{}
+	}
+	return friendRequest{
+		ID:        r.GetId(),
+		Status:    r.GetStatus(),
+		CreatedAt: r.GetCreatedAt().AsTime(),
+		From:      mapUserProfile(r.GetFrom()),
+		To:        mapUserProfile(r.GetTo()),
+	}
 }
 
 func mapPeriod(v string) nexusai.Period {
